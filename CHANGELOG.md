@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.2.0
+
 - Make the `receiveWith` pipeline composable via a pluggable `UploadReceiver`.
   `createUploads({ receiver })` defaults to `singleShotReceiver()` (identical
   behaviour to before) and accepts `singleShotReceiver({ validate, verify })` to
