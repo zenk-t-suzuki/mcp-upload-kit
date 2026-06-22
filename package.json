@@ -1,0 +1,59 @@
+{
+  "name": "mcp-upload-kit",
+  "version": "0.1.0",
+  "description": "Small Cloudflare Workers primitives for MCP file upload flows.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/zenk-t-suzuki/mcp-upload-kit.git"
+  },
+  "homepage": "https://github.com/zenk-t-suzuki/mcp-upload-kit#readme",
+  "bugs": {
+    "url": "https://github.com/zenk-t-suzuki/mcp-upload-kit/issues"
+  },
+  "type": "module",
+  "keywords": [
+    "mcp",
+    "upload",
+    "cloudflare-workers",
+    "workers",
+    "typescript"
+  ],
+  "main": "./dist/src/index.js",
+  "types": "./dist/src/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/src/index.d.ts",
+      "import": "./dist/src/index.js"
+    }
+  },
+  "files": [
+    "dist/src",
+    "LICENSE",
+    "README.md",
+    "package.json"
+  ],
+  "sideEffects": false,
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "prepare": "npm run build",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20250101.0",
+    "@modelcontextprotocol/sdk": "^1.20.2",
+    "typescript": "^5.6.0",
+    "vitest": "~2.1.0",
+    "zod": "^3.25.76"
+  },
+  "dependencies": {
+    "@noble/hashes": "^1.8.0"
+  },
+  "peerDependencies": {
+    "zod": "^3.23.0"
+  }
+}
