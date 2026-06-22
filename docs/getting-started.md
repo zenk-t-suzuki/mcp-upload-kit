@@ -21,7 +21,7 @@ responses, KV keys, and small MCP tool helpers.
 ## Install
 
 ```sh
-npm install https://github.com/zenk-t-suzuki/mcp-upload-kit/releases/download/v0.2.0/mcp-upload-kit-0.2.0.tgz zod
+npm install https://github.com/zenk-t-suzuki/mcp-upload-kit/releases/download/v0.3.0/mcp-upload-kit-0.3.0.tgz zod
 ```
 
 The package is distributed through GitHub Releases and is not yet published to
@@ -47,7 +47,7 @@ import { createUploads } from "mcp-upload-kit";
 ```ts
 import {
   createUploads,
-  kvUploadStore,
+  kvTransferStore,
   opaqueUploadToken,
   streamToUint8Array,
   type UploadDestination,
@@ -68,7 +68,7 @@ const destination: UploadDestination<{ objectKey: string }> = {
 
 const uploads = (env: Env, origin: string) =>
   createUploads({
-    store: kvUploadStore(env.UPLOAD_KV),
+    store: kvTransferStore(env.UPLOAD_KV),
     baseUrl: origin,
     maxBytes: 30 * 1024 * 1024,
     token: opaqueUploadToken(),

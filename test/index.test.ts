@@ -4,20 +4,21 @@ import {
   createUploadMcpBuilder,
   createUploadMcp,
   createUploads,
+  createDownloads,
   singleShotReceiver,
   resumableReceiver,
   createShaCountingStream,
-  createUploadToken,
+  createTransferToken,
   extractBearerToken,
   jsonResponse,
-  kvUploadStore,
+  kvTransferStore,
   opaqueUploadToken,
   parseContentRange,
   safeEqual,
   sha256Hex,
   signUploadJwt,
   standardUploadInput,
-  uploadKey,
+  transferKey,
   validateUploadRequest,
   verifyUploadJwt,
   streamToUint8Array,
@@ -25,6 +26,8 @@ import {
   type TransferUploadRecord,
   type UploadKvNamespace,
   type McpToolResult,
+  type TransferDownloadRecord,
+  type DownloadSource,
   type ResumableUploadDestination,
   type ResumableChunkOutcome,
 } from "../src/index";
@@ -49,8 +52,8 @@ function claims(overrides: Partial<UploadJwtClaims> = {}): UploadJwtClaims {
 
 describe("tokens", () => {
   test("creates opaque URL-safe tokens", () => {
-    expect(createUploadToken()).toMatch(/^[A-Za-z0-9_-]+$/);
-    expect(createUploadToken()).not.toBe(createUploadToken());
+    expect(createTransferToken()).toMatch(/^[A-Za-z0-9_-]+$/);
+    expect(createTransferToken()).not.toBe(createTransferToken());
   });
 
   test("extracts bearer tokens", () => {
@@ -202,7 +205,7 @@ describe("sha and responses", () => {
     expect(response.status).toBe(201);
     expect(response.headers.get("Content-Type")).toBe("application/json; charset=utf-8");
     expect(await response.json()).toEqual({ ok: true });
-    expect(uploadKey("abc")).toBe("upload:abc");
+    expect(transferKey("abc")).toBe("upload:abc");
   });
 });
 
@@ -210,7 +213,7 @@ describe("createUploads", () => {
   test("prepare -> receive -> complete stores the destination result", async () => {
     const kv = memoryKv();
     const uploads = createUploads<{ objectKey: string }>({
-      store: kvUploadStore<TransferUploadRecord<{ objectKey: string }>>(kv),
+      store: kvTransferStore<TransferUploadRecord<{ objectKey: string }>>(kv),
       baseUrl: "https://files.example.test",
       maxBytes: 1024,
       token: opaqueUploadToken(),
@@ -254,7 +257,7 @@ describe("createUploads", () => {
 
   test("rejects missing bearer token", async () => {
     const uploads = createUploads({
-      store: kvUploadStore<TransferUploadRecord>(memoryKv()),
+      store: kvTransferStore<TransferUploadRecord>(memoryKv()),
       baseUrl: "https://files.example.test",
       maxBytes: 1024,
     });
@@ -278,7 +281,7 @@ describe("createUploads", () => {
 
   test("supports destructured controller methods", async () => {
     const { prepare, receive, completeWith } = createUploads<{ objectKey: string }>({
-      store: kvUploadStore<TransferUploadRecord<{ objectKey: string }>>(memoryKv()),
+      store: kvTransferStore<TransferUploadRecord<{ objectKey: string }>>(memoryKv()),
       baseUrl: "https://files.example.test",
       maxBytes: 1024,
     });
@@ -310,7 +313,7 @@ describe("createUploads", () => {
 
   test("rejects direct prepare inputs with invalid required fields", async () => {
     const uploads = createUploads({
-      store: kvUploadStore<TransferUploadRecord>(memoryKv()),
+      store: kvTransferStore<TransferUploadRecord>(memoryKv()),
       baseUrl: "https://files.example.test",
       maxBytes: 1024,
     });
@@ -335,7 +338,7 @@ describe("createUploads", () => {
 
   test("rejects request bodies shorter than the prepared size", async () => {
     const uploads = createUploads({
-      store: kvUploadStore<TransferUploadRecord>(memoryKv()),
+      store: kvTransferStore<TransferUploadRecord>(memoryKv()),
       baseUrl: "https://files.example.test",
       maxBytes: 1024,
     });
@@ -361,7 +364,7 @@ describe("createUploads", () => {
 
   test("marks failed when declared length matches but actual body is shorter", async () => {
     const uploads = createUploads<{ objectKey: string }>({
-      store: kvUploadStore<TransferUploadRecord<{ objectKey: string }>>(memoryKv()),
+      store: kvTransferStore<TransferUploadRecord<{ objectKey: string }>>(memoryKv()),
       baseUrl: "https://files.example.test",
       maxBytes: 1024,
     });
@@ -402,7 +405,7 @@ describe("createUploads", () => {
 
   test("marks failed when destination does not consume the body stream", async () => {
     const uploads = createUploads<{ objectKey: string }>({
-      store: kvUploadStore<TransferUploadRecord<{ objectKey: string }>>(memoryKv()),
+      store: kvTransferStore<TransferUploadRecord<{ objectKey: string }>>(memoryKv()),
       baseUrl: "https://files.example.test",
       maxBytes: 1024,
     });
@@ -434,7 +437,7 @@ describe("createUploads", () => {
 
   test("keeps failed state when cleanup throws", async () => {
     const uploads = createUploads<{ objectKey: string }>({
-      store: kvUploadStore<TransferUploadRecord<{ objectKey: string }>>(memoryKv()),
+      store: kvTransferStore<TransferUploadRecord<{ objectKey: string }>>(memoryKv()),
       baseUrl: "https://files.example.test",
       maxBytes: 1024,
     });
@@ -466,7 +469,7 @@ describe("createUploads", () => {
 
   test("calls cleanup after a failed verification even when destination result is undefined", async () => {
     const uploads = createUploads<undefined>({
-      store: kvUploadStore<TransferUploadRecord<undefined>>(memoryKv()),
+      store: kvTransferStore<TransferUploadRecord<undefined>>(memoryKv()),
       baseUrl: "https://files.example.test",
       maxBytes: 1024,
     });
@@ -499,7 +502,7 @@ describe("createUploads", () => {
 
   test("marks failed and calls cleanup on sha mismatch", async () => {
     const uploads = createUploads<{ objectKey: string }>({
-      store: kvUploadStore<TransferUploadRecord<{ objectKey: string }>>(memoryKv()),
+      store: kvTransferStore<TransferUploadRecord<{ objectKey: string }>>(memoryKv()),
       baseUrl: "https://files.example.test",
       maxBytes: 1024,
     });
@@ -532,7 +535,7 @@ describe("createUploads", () => {
 
   test("rejects expired sessions before reading the body", async () => {
     const uploads = createUploads({
-      store: kvUploadStore<TransferUploadRecord>(memoryKv()),
+      store: kvTransferStore<TransferUploadRecord>(memoryKv()),
       baseUrl: "https://files.example.test",
       maxBytes: 1024,
       ttlSeconds: -1,
@@ -556,7 +559,7 @@ describe("createUploads", () => {
     type Result = { selected: "avatar" } | { selected: "attachment" };
     type RecordValue = TransferUploadRecord<Result, Purpose>;
     const uploads = createUploads<Result, Purpose, RecordValue>({
-      store: kvUploadStore<RecordValue>(memoryKv()),
+      store: kvTransferStore<RecordValue>(memoryKv()),
       baseUrl: "https://files.example.test",
       maxBytes: 1024,
     });
@@ -604,7 +607,7 @@ describe("createUploads", () => {
 
   test("receiveWith rejects when no destination matches", async () => {
     const uploads = createUploads({
-      store: kvUploadStore<TransferUploadRecord>(memoryKv()),
+      store: kvTransferStore<TransferUploadRecord>(memoryKv()),
       baseUrl: "https://files.example.test",
       maxBytes: 1024,
     });
@@ -629,7 +632,7 @@ describe("createUploadMcpBuilder", () => {
     type Result = { objectKey: string };
     type RecordValue = TransferUploadRecord<Result, Metadata>;
     const uploads = createUploads<Result, Metadata, RecordValue>({
-      store: kvUploadStore<RecordValue>(memoryKv()),
+      store: kvTransferStore<RecordValue>(memoryKv()),
       baseUrl: "https://files.example.test",
       maxBytes: 1024,
     });
@@ -683,7 +686,7 @@ describe("createUploadMcpBuilder", () => {
     type RecordValue = TransferUploadRecord<Result, Metadata>;
     const server = fakeMcpServer();
     const builder = createUploadMcp<Result, Metadata, RecordValue>({
-      store: kvUploadStore<RecordValue>(memoryKv()),
+      store: kvTransferStore<RecordValue>(memoryKv()),
       baseUrl: "https://files.example.test",
       maxBytes: 1024,
     }).addPurpose("file", {
@@ -729,7 +732,7 @@ describe("createUploadMcpBuilder", () => {
     type RecordValue = TransferUploadRecord<Result, Metadata>;
     const server = fakeMcpServer();
     const builder = createUploadMcp<Result, Metadata, RecordValue>({
-      store: kvUploadStore<RecordValue>(memoryKv()),
+      store: kvTransferStore<RecordValue>(memoryKv()),
       baseUrl: "https://files.example.test",
       maxBytes: 1024,
     })
@@ -787,7 +790,7 @@ describe("createUploadMcpBuilder", () => {
 describe("singleShotReceiver step overrides", () => {
   test("overriding verify keeps validate, streaming and the success path intact", async () => {
     const uploads = createUploads<{ objectKey: string }>({
-      store: kvUploadStore<TransferUploadRecord<{ objectKey: string }>>(memoryKv()),
+      store: kvTransferStore<TransferUploadRecord<{ objectKey: string }>>(memoryKv()),
       baseUrl: "https://files.example.test",
       maxBytes: 1024,
       // Accept whatever bytes arrive — e.g. a backend that hashes server-side.
@@ -823,7 +826,7 @@ describe("singleShotReceiver step overrides", () => {
   test("a custom verify can reject and still triggers cleanup", async () => {
     let cleaned = false;
     const uploads = createUploads<{ objectKey: string }>({
-      store: kvUploadStore<TransferUploadRecord<{ objectKey: string }>>(memoryKv()),
+      store: kvTransferStore<TransferUploadRecord<{ objectKey: string }>>(memoryKv()),
       baseUrl: "https://files.example.test",
       maxBytes: 1024,
       receiver: singleShotReceiver<{ objectKey: string }>({
@@ -862,7 +865,7 @@ describe("singleShotReceiver step overrides", () => {
 
   test("default validate is still enforced when only verify is overridden", async () => {
     const uploads = createUploads({
-      store: kvUploadStore<TransferUploadRecord>(memoryKv()),
+      store: kvTransferStore<TransferUploadRecord>(memoryKv()),
       baseUrl: "https://files.example.test",
       maxBytes: 1024,
       receiver: singleShotReceiver({ verify: () => ({ ok: true }) }),
@@ -919,7 +922,7 @@ describe("resumableReceiver", () => {
   test("accepts chunks, returns 308 then 200 and stores the result", async () => {
     const dest = memoryResumable();
     const uploads = createUploads<Result, unknown, RecordValue, ResumableUploadDestination<Result, RecordValue>>({
-      store: kvUploadStore<RecordValue>(memoryKv()),
+      store: kvTransferStore<RecordValue>(memoryKv()),
       baseUrl: "https://files.example.test",
       maxBytes: 1024,
       receiver: resumableReceiver<Result, RecordValue>(),
@@ -965,7 +968,7 @@ describe("resumableReceiver", () => {
       cleaned = true;
     });
     const uploads = createUploads<Result, unknown, RecordValue, ResumableUploadDestination<Result, RecordValue>>({
-      store: kvUploadStore<RecordValue>(memoryKv()),
+      store: kvTransferStore<RecordValue>(memoryKv()),
       baseUrl: "https://files.example.test",
       maxBytes: 1024,
       receiver: resumableReceiver<Result, RecordValue>(),
@@ -993,7 +996,7 @@ describe("resumableReceiver", () => {
   test("propagates a destination error outcome as its http status", async () => {
     const dest = memoryResumable();
     const uploads = createUploads<Result, unknown, RecordValue, ResumableUploadDestination<Result, RecordValue>>({
-      store: kvUploadStore<RecordValue>(memoryKv()),
+      store: kvTransferStore<RecordValue>(memoryKv()),
       baseUrl: "https://files.example.test",
       maxBytes: 1024,
       receiver: resumableReceiver<Result, RecordValue>(),
@@ -1018,7 +1021,7 @@ describe("resumableReceiver", () => {
   test("requires a Content-Range header", async () => {
     const dest = memoryResumable();
     const uploads = createUploads<Result, unknown, RecordValue, ResumableUploadDestination<Result, RecordValue>>({
-      store: kvUploadStore<RecordValue>(memoryKv()),
+      store: kvTransferStore<RecordValue>(memoryKv()),
       baseUrl: "https://files.example.test",
       maxBytes: 1024,
       receiver: resumableReceiver<Result, RecordValue>(),
@@ -1067,6 +1070,97 @@ function chunkRequest(
     body: body as unknown as BodyInit,
   });
 }
+
+describe("createDownloads", () => {
+  type Meta = { fileId: string };
+  type Rec = TransferDownloadRecord<Meta>;
+
+  function newDownloads(kv = memoryKv()) {
+    const downloads = createDownloads<Meta, Rec>({
+      store: kvTransferStore<Rec>(kv, "download:"),
+      baseUrl: "https://files.example.test",
+      ttlSeconds: 900,
+    });
+    return { downloads, kv };
+  }
+
+  const FILE_BYTES = new TextEncoder().encode("hello drive");
+  const source: DownloadSource<Meta, Rec> = {
+    async fetch({ record }) {
+      expect(record.metadata?.fileId).toBe("f1");
+      return new Response(FILE_BYTES, { status: 200 });
+    },
+  };
+
+  function getReq(token: string | null, method = "GET"): Request {
+    const headers: Record<string, string> = {};
+    if (token) headers.Authorization = `Bearer ${token}`;
+    return new Request("https://files.example.test/download/x", { method, headers });
+  }
+
+  test("prepare issues a URL grant and stores a record without bytes", async () => {
+    const { downloads, kv } = newDownloads();
+    const grant = await downloads.prepare({
+      owner: "user-1",
+      name: "hello.txt",
+      contentType: "text/plain",
+      size: FILE_BYTES.byteLength,
+      metadata: { fileId: "f1" },
+    });
+    expect(grant.downloadUrl).toBe(`https://files.example.test/download/${grant.downloadId}`);
+    expect(grant.downloadToken).toBeTruthy();
+    const stored = JSON.parse((await kv.get(`download:${grant.downloadId}`))!) as Rec;
+    expect(stored).toMatchObject({ owner: "user-1", token: grant.downloadToken, metadata: { fileId: "f1" } });
+  });
+
+  test("serve streams the source bytes for a valid grant", async () => {
+    const { downloads } = newDownloads();
+    const grant = await downloads.prepare({
+      owner: "user-1",
+      name: "hello.txt",
+      contentType: "text/plain",
+      size: FILE_BYTES.byteLength,
+      metadata: { fileId: "f1" },
+    });
+    const res = await downloads.serve({ downloadId: grant.downloadId, request: getReq(grant.downloadToken), source });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("Content-Type")).toBe("text/plain");
+    expect(res.headers.get("Content-Disposition")).toContain("hello.txt");
+    expect(new TextDecoder().decode(new Uint8Array(await res.arrayBuffer()))).toBe("hello drive");
+  });
+
+  test("serve rejects bad token / missing / expired / unknown / non-GET", async () => {
+    const { downloads } = newDownloads();
+    const grant = await downloads.prepare({ owner: "u", metadata: { fileId: "f1" } });
+
+    expect((await downloads.serve({ downloadId: grant.downloadId, request: getReq("nope"), source })).status).toBe(401);
+    expect((await downloads.serve({ downloadId: grant.downloadId, request: getReq(null), source })).status).toBe(401);
+    expect((await downloads.serve({ downloadId: "missing", request: getReq(grant.downloadToken), source })).status).toBe(404);
+    expect(
+      (await downloads.serve({ downloadId: grant.downloadId, request: getReq(grant.downloadToken, "POST"), source })).status,
+    ).toBe(405);
+  });
+
+  test("serve returns 410 once the grant has expired", async () => {
+    const kv = memoryKv();
+    const downloads = createDownloads<Meta, Rec>({
+      store: kvTransferStore<Rec>(kv, "download:"),
+      baseUrl: "https://files.example.test",
+      ttlSeconds: -1, // already expired
+    });
+    const grant = await downloads.prepare({ owner: "u", metadata: { fileId: "f1" } });
+    const res = await downloads.serve({ downloadId: grant.downloadId, request: getReq(grant.downloadToken), source });
+    expect(res.status).toBe(410);
+  });
+
+  test("serve returns 502 when the source response is not ok", async () => {
+    const { downloads } = newDownloads();
+    const grant = await downloads.prepare({ owner: "u", metadata: { fileId: "f1" } });
+    const failing: DownloadSource<Meta, Rec> = { async fetch() { return new Response("err", { status: 403 }); } };
+    const res = await downloads.serve({ downloadId: grant.downloadId, request: getReq(grant.downloadToken), source: failing });
+    expect(res.status).toBe(502);
+  });
+});
 
 function uploadRequest(url: string, token: string, body: Uint8Array): Request {
   return new Request(url, {

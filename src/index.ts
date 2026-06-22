@@ -24,7 +24,7 @@ export interface UploadPrepareResult {
   expiresAt: string;
 }
 
-export interface UploadStore<RecordValue> {
+export interface TransferStore<RecordValue> {
   get(uploadId: string): Promise<RecordValue | null>;
   put(uploadId: string, record: RecordValue, ttlSeconds: number): Promise<void>;
 }
@@ -96,7 +96,7 @@ export interface CreateUploadsOptions<
   RecordValue extends TransferUploadRecord = TransferUploadRecord,
   Dest = UploadDestination<unknown, RecordValue>,
 > {
-  store: UploadStore<RecordValue>;
+  store: TransferStore<RecordValue>;
   baseUrl: string;
   maxBytes: number | string;
   ttlSeconds?: number;
@@ -290,11 +290,11 @@ export type UploadRequestValidation =
 const DEFAULT_UPLOAD_TTL_SECONDS = 900;
 const DEFAULT_UPLOAD_KV_TTL_GRACE_SECONDS = 3600;
 
-export function createUploadId(): string {
+export function createTransferId(): string {
   return crypto.randomUUID();
 }
 
-export function createUploadToken(byteLength = 32): string {
+export function createTransferToken(byteLength = 32): string {
   if (!Number.isInteger(byteLength) || byteLength <= 0) {
     throw new Error("byteLength must be a positive integer");
   }
@@ -314,21 +314,21 @@ export function extractBearerToken(input: Headers | Request | string | null): st
   return match?.[1] ?? null;
 }
 
-export function uploadKey(uploadId: string, prefix = "upload:"): string {
+export function transferKey(uploadId: string, prefix = "upload:"): string {
   return prefix + uploadId;
 }
 
-export function kvUploadStore<RecordValue>(
+export function kvTransferStore<RecordValue>(
   kv: UploadKvNamespace,
   prefix = "upload:",
-): UploadStore<RecordValue> {
+): TransferStore<RecordValue> {
   return {
     async get(uploadId) {
-      const raw = await kv.get(uploadKey(uploadId, prefix));
+      const raw = await kv.get(transferKey(uploadId, prefix));
       return raw ? (JSON.parse(raw) as RecordValue) : null;
     },
     async put(uploadId, record, ttlSeconds) {
-      await kv.put(uploadKey(uploadId, prefix), JSON.stringify(record), {
+      await kv.put(transferKey(uploadId, prefix), JSON.stringify(record), {
         expirationTtl: Math.max(60, ttlSeconds),
       });
     },
@@ -419,7 +419,7 @@ export function validateUploadRequest({
 export function opaqueUploadToken(byteLength = 32): UploadTokenStrategy {
   return {
     async issue() {
-      return createUploadToken(byteLength);
+      return createTransferToken(byteLength);
     },
     async verify({ token, record }) {
       if (!record.token || !safeEqual(token, record.token)) {
@@ -590,7 +590,7 @@ export function createUploads<
 
   async function prepare(input: PrepareUploadInput<Metadata>): Promise<UploadPrepareResult> {
     validatePrepareUploadInput(input, resolvedMaxBytes);
-    const uploadId = createUploadId();
+    const uploadId = createTransferId();
     const issuedAt = Math.floor(Date.now() / 1000);
     const expiresAtSeconds = issuedAt + ttlSeconds;
     const uploadToken = await token.issue({
@@ -954,6 +954,149 @@ async function runResumableCleanup<Result, RecordValue extends TransferUploadRec
   } catch {
     // The upload state must remain failed even if backend cleanup fails.
   }
+}
+
+// --- Downloads -------------------------------------------------------------
+//
+// The mirror image of uploads: instead of bytes flowing in over a direct PUT,
+// `download_file`-style tools hand the client a short-lived signed GET URL and
+// the bytes flow out over a direct GET — so large files never travel through
+// the MCP channel or the model's context. The kit owns issuing/verifying the
+// grant and wiring the stream; the app supplies a `DownloadSource` that fetches
+// the bytes from its backend (Drive, kintone, R2, ...).
+
+export interface TransferDownloadRecord<Metadata = unknown> {
+  downloadId: string;
+  owner: string;
+  token: string;
+  expiresAt: string;
+  name?: string;
+  contentType?: string;
+  size?: number;
+  metadata?: Metadata;
+}
+
+export interface DownloadPrepareInput<Metadata = unknown> {
+  owner: string;
+  name?: string;
+  contentType?: string;
+  size?: number;
+  metadata?: Metadata;
+}
+
+export interface DownloadGrant {
+  downloadId: string;
+  downloadUrl: string;
+  downloadToken: string;
+  expiresAt: string;
+}
+
+/** Fetches the bytes for a verified download grant from the app's backend. */
+export interface DownloadSource<
+  Metadata = unknown,
+  RecordValue extends TransferDownloadRecord<Metadata> = TransferDownloadRecord<Metadata>,
+> {
+  /** Return a Response whose body streams to the client (e.g. Drive `alt=media`). */
+  fetch(input: { record: RecordValue; request: Request }): Promise<Response>;
+}
+
+export interface CreateDownloadsOptions<
+  RecordValue extends TransferDownloadRecord = TransferDownloadRecord,
+> {
+  store: TransferStore<RecordValue>;
+  baseUrl: string;
+  ttlSeconds?: number;
+  downloadPath?: string;
+}
+
+export interface ServeDownloadInput<
+  Metadata,
+  RecordValue extends TransferDownloadRecord<Metadata> = TransferDownloadRecord<Metadata>,
+> {
+  downloadId: string;
+  request: Request;
+  source: DownloadSource<Metadata, RecordValue>;
+}
+
+export function createDownloads<
+  Metadata = unknown,
+  RecordValue extends TransferDownloadRecord<Metadata> = TransferDownloadRecord<Metadata>,
+>({
+  store,
+  baseUrl,
+  ttlSeconds = DEFAULT_UPLOAD_TTL_SECONDS,
+  downloadPath = "/download",
+}: CreateDownloadsOptions<RecordValue>) {
+  const origin = baseUrl.replace(/\/$/, "");
+  const normalizedPath = downloadPath.startsWith("/") ? downloadPath : `/${downloadPath}`;
+  const storeTtl = ttlSeconds + DEFAULT_UPLOAD_KV_TTL_GRACE_SECONDS;
+
+  /** Issue a short-lived grant and persist it. Returns the URL, NOT the bytes. */
+  async function prepare(input: DownloadPrepareInput<Metadata>): Promise<DownloadGrant> {
+    const downloadId = createTransferId();
+    const token = createTransferToken();
+    const exp = Math.floor(Date.now() / 1000) + ttlSeconds;
+    const expiresAt = new Date(exp * 1000).toISOString();
+    const record = {
+      downloadId,
+      owner: input.owner,
+      token,
+      expiresAt,
+      ...(input.name !== undefined ? { name: input.name } : {}),
+      ...(input.contentType !== undefined ? { contentType: input.contentType } : {}),
+      ...(input.size !== undefined ? { size: input.size } : {}),
+      ...(input.metadata !== undefined ? { metadata: input.metadata } : {}),
+    } as RecordValue;
+    await store.put(downloadId, record, storeTtl);
+    return {
+      downloadId,
+      downloadUrl: `${origin}${normalizedPath}/${downloadId}`,
+      downloadToken: token,
+      expiresAt,
+    };
+  }
+
+  async function get(downloadId: string): Promise<RecordValue | null> {
+    return store.get(downloadId);
+  }
+
+  /** Verify the grant (bearer + expiry) and stream the source's bytes. */
+  async function serve({ downloadId, request, source }: ServeDownloadInput<Metadata, RecordValue>): Promise<Response> {
+    if (request.method !== "GET") {
+      return jsonResponse({ error: "method not allowed" }, 405, { Allow: "GET" });
+    }
+    const record = await store.get(downloadId);
+    if (!record) return jsonResponse({ error: "download not found" }, 404);
+
+    const bearer = extractBearerToken(request);
+    if (!bearer || !safeEqual(bearer, record.token)) {
+      return jsonResponse({ error: "invalid download token" }, 401);
+    }
+    if (Date.parse(record.expiresAt) < Date.now()) {
+      return jsonResponse({ error: "download link expired" }, 410);
+    }
+
+    let res: Response;
+    try {
+      res = await source.fetch({ record, request });
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : "download failed";
+      return jsonResponse({ error: "download failed", reason }, 502);
+    }
+    if (!res.ok || !res.body) {
+      return jsonResponse({ error: `download source failed: ${res.status}` }, 502);
+    }
+
+    const headers = new Headers({
+      "Content-Type": record.contentType || "application/octet-stream",
+      "Content-Disposition": `attachment; filename*=UTF-8''${encodeURIComponent(record.name ?? downloadId)}`,
+    });
+    if (record.size !== undefined) headers.set("Content-Length", String(record.size));
+
+    return new Response(res.body, { status: 200, headers });
+  }
+
+  return { prepare, get, serve };
 }
 
 export async function streamToUint8Array(stream: ReadableStream<Uint8Array>): Promise<Uint8Array> {

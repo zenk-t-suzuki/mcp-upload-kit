@@ -7,6 +7,7 @@ Task-oriented recipes. See [Concepts](concepts.md) for the model and the
 - [Implementing a storage destination](#implementing-a-storage-destination)
 - [Overriding a pipeline step](#overriding-a-pipeline-step)
 - [Resumable (chunked) uploads](#resumable-chunked-uploads)
+- [Download URLs](#download-urls)
 - [Custom upload store](#custom-upload-store)
 - [Registering MCP tools](#registering-mcp-tools)
 
@@ -154,15 +155,62 @@ receiver replies `308` (with a `Range` header) until the final chunk completes.
 See [`examples/mcp-server-resumable`](../examples/mcp-server-resumable) for a
 runnable version.
 
-## Custom upload store
+## Download URLs
 
-`kvUploadStore(kv)` covers Workers KV. For atomic single-use enforcement or a
-different backend, implement `UploadStore`:
+To let a tool return a file without putting its bytes through the MCP channel,
+use `createDownloads`. The tool issues a short-lived signed URL; a `GET` route
+verifies it and streams the bytes from your backend.
 
 ```ts
-import { type UploadStore, type TransferUploadRecord } from "mcp-upload-kit";
+import { createDownloads, kvTransferStore, type DownloadSource } from "mcp-upload-kit";
 
-function d1Store<R extends TransferUploadRecord>(db: D1Database): UploadStore<R> {
+type Meta = { fileId: string };
+
+const downloads = createDownloads<Meta>({
+  store: kvTransferStore(env.UPLOAD_KV, "download:"),
+  baseUrl: env.WORKER_BASE_URL,
+  ttlSeconds: 900,
+});
+
+// 1. In a `download_file` MCP tool — return the URL, not the bytes:
+const grant = await downloads.prepare({
+  owner: userId,
+  name: meta.name,
+  contentType: meta.mimeType,
+  size: meta.size,
+  metadata: { fileId },
+});
+return grant; // { downloadId, downloadUrl, downloadToken, expiresAt }
+
+// 2. Your backend fetch (the download counterpart of UploadDestination):
+const source: DownloadSource<Meta> = {
+  async fetch({ record }) {
+    const accessToken = await getAccessToken(record.owner);
+    return fetch(`https://www.googleapis.com/drive/v3/files/${record.metadata!.fileId}?alt=media`, {
+      headers: { Authorization: `Bearer ${accessToken}` },
+    });
+  },
+};
+
+// 3. Route `GET /download/:downloadId` here:
+export const handleDownload = (request: Request, downloadId: string) =>
+  downloads.serve({ downloadId, request, source });
+```
+
+The client fetches `GET <downloadUrl>` with `Authorization: Bearer <downloadToken>`.
+`serve` returns `401` (bad/missing token), `404` (unknown id), `410` (expired),
+`405` (non-GET), or `502` (source failed); on success it streams `200` with
+`Content-Type` / `Content-Disposition` / `Content-Length` from the grant.
+
+## Custom upload store
+
+`kvTransferStore(kv)` covers Workers KV. For atomic single-use enforcement or a
+different backend, implement `TransferStore`:
+
+```ts
+import { type TransferStore, type TransferUploadRecord } from "mcp-upload-kit";
+
+function d1Store<R extends TransferUploadRecord>(db: D1Database): TransferStore<R> {
   return {
     async get(uploadId) {
       const row = await db.prepare("select json from uploads where id = ?").bind(uploadId).first<{ json: string }>();

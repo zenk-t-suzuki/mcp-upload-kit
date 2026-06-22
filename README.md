@@ -15,12 +15,15 @@ responses, KV keys, and small MCP tool helpers.
   without reimplementing the rest.
 - **Single-shot or resumable** — `singleShotReceiver()` (default) or
   `resumableReceiver()` for chunked `Content-Range` uploads.
+- **Uploads and downloads** — `createDownloads` mirrors `createUploads`: hand the
+  client a short-lived signed download URL instead of returning bytes, so large
+  files never pass through the MCP channel or the model context.
 - **Workers-native** — targets Web Platform APIs (Cloudflare Workers et al.).
 
 ## Install
 
 ```sh
-npm install https://github.com/zenk-t-suzuki/mcp-upload-kit/releases/download/v0.2.0/mcp-upload-kit-0.2.0.tgz zod
+npm install https://github.com/zenk-t-suzuki/mcp-upload-kit/releases/download/v0.3.0/mcp-upload-kit-0.3.0.tgz zod
 ```
 
 Distributed via GitHub Releases (not yet on the npm registry). `zod` is a peer
@@ -34,10 +37,10 @@ import { createUploads } from "mcp-upload-kit";
 ## Quick start
 
 ```ts
-import { createUploads, kvUploadStore, opaqueUploadToken, streamToUint8Array } from "mcp-upload-kit";
+import { createUploads, kvTransferStore, opaqueUploadToken, streamToUint8Array } from "mcp-upload-kit";
 
 const uploads = createUploads({
-  store: kvUploadStore(env.UPLOAD_KV),
+  store: kvTransferStore(env.UPLOAD_KV),
   baseUrl: origin,
   maxBytes: 30 * 1024 * 1024,
   token: opaqueUploadToken(),

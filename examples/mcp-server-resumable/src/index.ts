@@ -13,7 +13,7 @@ import {
   registerCompleteUploadTool,
   standardUploadInput,
   opaqueUploadToken,
-  kvUploadStore,
+  kvTransferStore,
   sha256Hex,
   type TransferUploadRecord,
   type ResumableUploadDestination, // [RESUMABLE]
@@ -63,7 +63,7 @@ const destination: ResumableUploadDestination<StoredFile, FileRecord> = {
 
 function uploads(env: Env) {
   return createUploads<StoredFile, unknown, FileRecord, ResumableUploadDestination<StoredFile, FileRecord>>({
-    store: kvUploadStore<FileRecord>(env.UPLOAD_KV),
+    store: kvTransferStore<FileRecord>(env.UPLOAD_KV),
     baseUrl: env.WORKER_BASE_URL,
     maxBytes: 100 * 1024 * 1024,
     token: opaqueUploadToken(),

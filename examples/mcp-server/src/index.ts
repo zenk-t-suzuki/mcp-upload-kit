@@ -12,7 +12,7 @@ import {
   registerCompleteUploadTool,
   standardUploadInput,
   opaqueUploadToken,
-  kvUploadStore,
+  kvTransferStore,
   streamToUint8Array,
   type TransferUploadRecord,
   type UploadDestination,
@@ -41,7 +41,7 @@ const destination: UploadDestination<StoredFile, FileRecord> = {
 
 function uploads(env: Env) {
   return createUploads<StoredFile>({
-    store: kvUploadStore<FileRecord>(env.UPLOAD_KV),
+    store: kvTransferStore<FileRecord>(env.UPLOAD_KV),
     baseUrl: env.WORKER_BASE_URL,
     maxBytes: 30 * 1024 * 1024,
     token: opaqueUploadToken(),

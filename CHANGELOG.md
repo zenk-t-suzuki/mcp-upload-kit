@@ -2,6 +2,33 @@
 
 ## Unreleased
 
+## 0.3.0
+
+### Breaking
+
+The kit now covers downloads as well as uploads, so a few shared primitives were
+renamed to transfer-neutral names:
+
+- `createUploadId` → `createTransferId`
+- `createUploadToken` → `createTransferToken`
+- `uploadKey` → `transferKey`
+- `UploadStore` → `TransferStore`
+- `kvUploadStore` → `kvTransferStore`
+
+Upload-specific API (`createUploads`, `UploadDestination`, `singleShotReceiver`,
+`resumableReceiver`, `opaqueUploadToken`, `jwtUploadToken`, `signUploadJwt`, …)
+is unchanged.
+
+### Added
+
+- `createDownloads({ store, baseUrl, ttlSeconds?, downloadPath? })` — the mirror
+  image of `createUploads`. `prepare()` issues a short-lived signed download URL
+  (not the bytes); `serve()` verifies the grant (bearer + expiry) and streams the
+  bytes from a `DownloadSource` straight to the client, so large files never pass
+  through the MCP channel or the model context.
+- `DownloadSource`, `TransferDownloadRecord`, `DownloadGrant`,
+  `DownloadPrepareInput`, `CreateDownloadsOptions`, `ServeDownloadInput` types.
+
 ## 0.2.0
 
 - Make the `receiveWith` pipeline composable via a pluggable `UploadReceiver`.

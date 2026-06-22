@@ -28,7 +28,7 @@ Options (`CreateUploadsOptions`):
 
 | Field | Default | Description |
 | --- | --- | --- |
-| `store` | — (required) | `UploadStore` for records. |
+| `store` | — (required) | `TransferStore` for records. |
 | `baseUrl` | — (required) | Origin used to build `uploadUrl`. |
 | `maxBytes` | — (required) | Max upload size (number or numeric string). |
 | `ttlSeconds` | `900` | Upload token / URL lifetime. |
@@ -71,13 +71,42 @@ the selected `ResumableUploadDestination`.
 
 ## Stores
 
-### `kvUploadStore(kv, prefix?)`
+### `kvTransferStore(kv, prefix?)`
 
 ```ts
-kvUploadStore<RecordValue>(kv: UploadKvNamespace, prefix = "upload:"): UploadStore<RecordValue>
+kvTransferStore<RecordValue>(kv: UploadKvNamespace, prefix = "upload:"): TransferStore<RecordValue>
 ```
 
-Adapts a Workers KV namespace. Implement `UploadStore` for other backends.
+Adapts a Workers KV namespace. Implement `TransferStore` for other backends.
+
+## Download controller
+
+### `createDownloads(options)`
+
+```ts
+createDownloads<Metadata, RecordValue>(options): {
+  prepare(input: DownloadPrepareInput<Metadata>): Promise<DownloadGrant>;
+  get(downloadId): Promise<RecordValue | null>;
+  serve(input: { downloadId, request, source }): Promise<Response>;
+}
+```
+
+Options (`CreateDownloadsOptions`): `store` (a `TransferStore`), `baseUrl`,
+`ttlSeconds?` (default 900), `downloadPath?` (default `/download`).
+
+- `prepare({ owner, name?, contentType?, size?, metadata? })` stores a grant and
+  returns `{ downloadId, downloadUrl, downloadToken, expiresAt }` — never the bytes.
+- `serve({ downloadId, request, source })` verifies the bearer token + expiry,
+  then streams `source.fetch({ record, request })`'s response body to the client
+  with `Content-Type` / `Content-Disposition` / `Content-Length` from the record.
+
+`DownloadSource<Metadata>` is the app's backend fetch:
+
+```ts
+interface DownloadSource<Metadata> {
+  fetch(input: { record: TransferDownloadRecord<Metadata>; request: Request }): Promise<Response>;
+}
+```
 
 ## Token strategies
 
@@ -104,10 +133,10 @@ standardUploadInput({ extra?, contentType?, maxSize? }?): zod input shape
 ## Primitives
 
 ```ts
-createUploadId(): string
-createUploadToken(byteLength = 32): string
+createTransferId(): string
+createTransferToken(byteLength = 32): string
 extractBearerToken(input: Headers | Request | string | null): string | null
-uploadKey(uploadId: string, prefix = "upload:"): string
+transferKey(uploadId: string, prefix = "upload:"): string
 parseContentRange(value: string): ContentRange | null
 validateUploadRequest({ request, maxBytes, expectedSize?, requireBody? }): UploadRequestValidation
 jsonResponse(body: unknown, status = 200, headers = {}): Response
@@ -130,7 +159,7 @@ streamToUint8Array(stream: ReadableStream<Uint8Array>): Promise<Uint8Array>
 ## Types
 
 Controller / records: `UploadStatus`, `BaseUploadRecord`, `TransferUploadRecord`,
-`UploadPrepareResult`, `UploadStore`, `UploadKvNamespace`,
+`UploadPrepareResult`, `TransferStore`, `UploadKvNamespace`,
 `CreateUploadsOptions`, `PrepareUploadInput`, `ReceiveUploadInput`,
 `ReceiveUploadWithInput`, `CompleteUploadInput`, `CompleteUploadWithInput`,
 `CompleteUploadController`, `UploadMcpController`.
@@ -142,6 +171,9 @@ Receivers / destinations: `UploadReceiver`, `UploadReceiverContext`,
 `UploadVerifyResult`, `SingleShotReceiverSteps`, `UploadDestination`,
 `UploadDestinationInput`, `ResumableUploadDestination`, `ResumableChunkInput`,
 `ResumableChunkOutcome`.
+
+Downloads: `DownloadSource`, `TransferDownloadRecord`, `DownloadPrepareInput`,
+`DownloadGrant`, `CreateDownloadsOptions`, `ServeDownloadInput`.
 
 Requests / streams: `ContentRange`, `ValidateUploadRequestOptions`,
 `UploadRequestValidation`, `ShaCountingStream`.

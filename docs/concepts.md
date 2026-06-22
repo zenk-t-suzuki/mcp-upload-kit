@@ -33,12 +33,12 @@ measured `actualSize`/`actualSha256`, your destination's `result`, and
 `metadata` you attach at prepare time.
 
 > The built-in KV store is best-effort under concurrent PUTs. If you need strict
-> single-use enforcement under parallel requests, supply a custom `UploadStore`
+> single-use enforcement under parallel requests, supply a custom `TransferStore`
 > with an atomic claim step.
 
 ## Stores
 
-An `UploadStore<RecordValue>` is a `get`/`put` pair. `kvUploadStore(kv)` adapts a
+An `TransferStore<RecordValue>` is a `get`/`put` pair. `kvTransferStore(kv)` adapts a
 Workers KV namespace; implement the interface yourself to back records with
 Durable Objects, D1, or any other store.
 
@@ -87,6 +87,26 @@ A **destination** is your backend-specific code.
 
 If a single-shot `receive` resolves without fully consuming `body`, the kit marks
 the upload failed, because it cannot verify size or SHA-256.
+
+## Downloads
+
+`createDownloads` is the mirror image of `createUploads`. Where an upload tool
+hands the client a PUT URL and bytes flow *in*, a download tool hands the client
+a short-lived signed GET URL and bytes flow *out* — so large files never travel
+through the MCP channel or the model's context.
+
+- `prepare({ owner, name?, contentType?, size?, metadata? })` stores a grant and
+  returns `{ downloadId, downloadUrl, downloadToken, expiresAt }`. It never
+  returns bytes.
+- `serve({ downloadId, request, source })` verifies the bearer token (constant
+  time) and expiry, then streams `source.fetch(...)`'s response body to the
+  client.
+
+A `DownloadSource` is your backend fetch (the download counterpart of an
+`UploadDestination`): given the grant record, return a `Response` whose body is
+the file (e.g. Google Drive `alt=media`, a kintone file fetch, an R2 object). The
+kit reuses the same `TransferStore` for download grants. See
+[Guides → Download URLs](guides.md#download-urls).
 
 ## Response codes
 
