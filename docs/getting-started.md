@@ -21,7 +21,7 @@ responses, KV keys, and small MCP tool helpers.
 ## Install
 
 ```sh
-npm install https://github.com/zenk-t-suzuki/mcp-upload-kit/releases/download/v0.3.0/mcp-upload-kit-0.3.0.tgz zod
+npm install https://github.com/zenk-t-suzuki/mcp-upload-kit/releases/download/v0.3.1/mcp-upload-kit-0.3.1.tgz zod
 ```
 
 The package is distributed through GitHub Releases and is not yet published to

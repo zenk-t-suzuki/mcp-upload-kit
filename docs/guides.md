@@ -199,8 +199,13 @@ export const handleDownload = (request: Request, downloadId: string) =>
 
 The client fetches `GET <downloadUrl>` with `Authorization: Bearer <downloadToken>`.
 `serve` returns `401` (bad/missing token), `404` (unknown id), `410` (expired),
-`405` (non-GET), or `502` (source failed); on success it streams `200` with
-`Content-Type` / `Content-Disposition` / `Content-Length` from the grant.
+`405` (non-GET), or `502` (source failed); on success it streams `200`.
+
+Response headers come from the grant (`contentType` → `Content-Type`, `name` →
+`Content-Disposition`, `size` → `Content-Length`), falling back to whatever the
+source `Response` advertised when the grant omits them. So a backend that only
+learns the MIME type after fetching the bytes can set `Content-Type` on its own
+`Response` and `serve` will pass it through.
 
 ## Custom upload store
 

@@ -1,6 +1,6 @@
 {
   "name": "mcp-upload-kit",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Small Cloudflare Workers primitives for MCP file upload flows.",
   "license": "MIT",
   "repository": {

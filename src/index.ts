@@ -1087,11 +1087,23 @@ export function createDownloads<
       return jsonResponse({ error: `download source failed: ${res.status}` }, 502);
     }
 
-    const headers = new Headers({
-      "Content-Type": record.contentType || "application/octet-stream",
-      "Content-Disposition": `attachment; filename*=UTF-8''${encodeURIComponent(record.name ?? downloadId)}`,
-    });
-    if (record.size !== undefined) headers.set("Content-Length", String(record.size));
+    // Prefer values declared on the grant; otherwise fall back to whatever the
+    // source response advertised (e.g. a backend that only knows the MIME type
+    // once it has fetched the bytes).
+    const headers = new Headers();
+    headers.set(
+      "Content-Type",
+      record.contentType ?? res.headers.get("Content-Type") ?? "application/octet-stream",
+    );
+    if (record.name) {
+      headers.set("Content-Disposition", `attachment; filename*=UTF-8''${encodeURIComponent(record.name)}`);
+    } else {
+      const sourceDisposition = res.headers.get("Content-Disposition");
+      if (sourceDisposition) headers.set("Content-Disposition", sourceDisposition);
+    }
+    const contentLength =
+      record.size !== undefined ? String(record.size) : res.headers.get("Content-Length");
+    if (contentLength) headers.set("Content-Length", contentLength);
 
     return new Response(res.body, { status: 200, headers });
   }

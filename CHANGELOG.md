@@ -2,6 +2,14 @@
 
 ## Unreleased
 
+## 0.3.1
+
+- `createDownloads().serve()` now falls back to the source response's
+  `Content-Type` / `Content-Disposition` / `Content-Length` when the grant did
+  not declare them. Grant values still win when present. This lets a backend
+  that only learns the MIME type after fetching the bytes (e.g. by sniffing)
+  advertise it without the grant having to know it up front.
+
 ## 0.3.0
 
 ### Breaking

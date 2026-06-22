@@ -1153,6 +1153,47 @@ describe("createDownloads", () => {
     expect(res.status).toBe(410);
   });
 
+  test("serve falls back to the source response headers when the grant omits them", async () => {
+    const { downloads } = newDownloads();
+    // No name / contentType / size on the grant.
+    const grant = await downloads.prepare({ owner: "u", metadata: { fileId: "f1" } });
+    const sniffing: DownloadSource<Meta, Rec> = {
+      async fetch() {
+        return new Response(FILE_BYTES, {
+          status: 200,
+          headers: {
+            "Content-Type": "application/pdf",
+            "Content-Length": String(FILE_BYTES.byteLength),
+            "Content-Disposition": "attachment; filename=\"from-source.pdf\"",
+          },
+        });
+      },
+    };
+    const res = await downloads.serve({ downloadId: grant.downloadId, request: getReq(grant.downloadToken), source: sniffing });
+    expect(res.status).toBe(200);
+    expect(res.headers.get("Content-Type")).toBe("application/pdf");
+    expect(res.headers.get("Content-Length")).toBe(String(FILE_BYTES.byteLength));
+    expect(res.headers.get("Content-Disposition")).toContain("from-source.pdf");
+  });
+
+  test("grant values win over the source response headers", async () => {
+    const { downloads } = newDownloads();
+    const grant = await downloads.prepare({
+      owner: "u",
+      name: "grant.txt",
+      contentType: "text/plain",
+      metadata: { fileId: "f1" },
+    });
+    const other: DownloadSource<Meta, Rec> = {
+      async fetch() {
+        return new Response(FILE_BYTES, { status: 200, headers: { "Content-Type": "application/pdf" } });
+      },
+    };
+    const res = await downloads.serve({ downloadId: grant.downloadId, request: getReq(grant.downloadToken), source: other });
+    expect(res.headers.get("Content-Type")).toBe("text/plain");
+    expect(res.headers.get("Content-Disposition")).toContain("grant.txt");
+  });
+
   test("serve returns 502 when the source response is not ok", async () => {
     const { downloads } = newDownloads();
     const grant = await downloads.prepare({ owner: "u", metadata: { fileId: "f1" } });
