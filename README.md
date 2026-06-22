@@ -11,8 +11,11 @@ safe token comparison, SHA-256 helpers, and small MCP tool helpers.
 ## Install
 
 ```sh
-npm install mcp-upload-kit zod
+npm install https://github.com/zenk-t-suzuki/mcp-upload-kit/releases/download/v0.1.0/mcp-upload-kit-0.1.0.tgz zod
 ```
+
+The package is currently distributed through GitHub Releases and is not yet
+published to the npm registry.
 
 `zod` is a peer dependency because MCP tool schemas should use the same Zod copy as
 the host server. The package targets Web Platform APIs available in Cloudflare
