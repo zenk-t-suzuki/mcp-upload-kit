@@ -92,13 +92,24 @@ export interface UploadDestination<
   }): unknown;
 }
 
-export interface CreateUploadsOptions<RecordValue extends TransferUploadRecord = TransferUploadRecord> {
+export interface CreateUploadsOptions<
+  RecordValue extends TransferUploadRecord = TransferUploadRecord,
+  Dest = UploadDestination<unknown, RecordValue>,
+> {
   store: UploadStore<RecordValue>;
   baseUrl: string;
   maxBytes: number | string;
   ttlSeconds?: number;
   token?: UploadTokenStrategy<RecordValue>;
   uploadPath?: string;
+  /**
+   * Strategy that turns a verified PUT into a stored result. Defaults to
+   * `singleShotReceiver()` (one PUT carries the whole body). Swap in
+   * `resumableReceiver()` for chunked `Content-Range` uploads, or pass a
+   * `singleShotReceiver({ validate, verify })` with only the step(s) you
+   * want to override — the rest keep their defaults.
+   */
+  receiver?: UploadReceiver<any, RecordValue, Dest>;
 }
 
 export interface PrepareUploadInput<Metadata = unknown> {
@@ -110,16 +121,24 @@ export interface PrepareUploadInput<Metadata = unknown> {
   metadata?: Metadata;
 }
 
-export interface ReceiveUploadInput<Result, RecordValue extends TransferUploadRecord<Result> = TransferUploadRecord<Result>> {
+export interface ReceiveUploadInput<
+  Result,
+  RecordValue extends TransferUploadRecord<Result> = TransferUploadRecord<Result>,
+  Dest = UploadDestination<Result, RecordValue>,
+> {
   uploadId: string;
   request: Request;
-  destination: UploadDestination<Result, RecordValue>;
+  destination: Dest;
 }
 
-export interface ReceiveUploadWithInput<Result, RecordValue extends TransferUploadRecord<Result> = TransferUploadRecord<Result>> {
+export interface ReceiveUploadWithInput<
+  Result,
+  RecordValue extends TransferUploadRecord<Result> = TransferUploadRecord<Result>,
+  Dest = UploadDestination<Result, RecordValue>,
+> {
   uploadId: string;
   request: Request;
-  selectDestination(record: RecordValue): UploadDestination<Result, RecordValue> | null | undefined;
+  selectDestination(record: RecordValue): Dest | null | undefined;
 }
 
 export interface CompleteUploadInput {
@@ -454,10 +473,107 @@ export function jwtUploadToken(secret: string): UploadTokenStrategy {
   };
 }
 
+/**
+ * Shared services handed to an {@link UploadReceiver}. The orchestrator has
+ * already loaded the record, checked expiry and verified the bearer token, so a
+ * receiver only has to move bytes and decide the HTTP outcome. `complete` and
+ * `fail` own the record-store transitions; a receiver runs its own backend
+ * cleanup separately (it owns the destination).
+ */
+export interface UploadReceiverContext<
+  Result,
+  RecordValue extends TransferUploadRecord<Result> = TransferUploadRecord<Result>,
+> {
+  uploadId: string;
+  request: Request;
+  record: RecordValue;
+  /** Configured `maxBytes` for this controller (already resolved to a number). */
+  maxBytes: number;
+  /** Persist a `completed` record and return the stored value. */
+  complete(input: { actualSize: number; actualSha256: string; result: Result }): Promise<RecordValue>;
+  /** Persist a `failed` record. Backend cleanup is the receiver's responsibility. */
+  fail(reason: string): Promise<void>;
+}
+
+/**
+ * Pluggable transfer strategy for `receiveWith`. The default is
+ * {@link singleShotReceiver}; {@link resumableReceiver} handles chunked uploads.
+ * Implement this directly only for a genuinely new transfer protocol.
+ */
+export interface UploadReceiver<
+  Result = unknown,
+  RecordValue extends TransferUploadRecord<Result> = TransferUploadRecord<Result>,
+  Dest = UploadDestination<Result, RecordValue>,
+> {
+  handle(input: {
+    ctx: UploadReceiverContext<Result, RecordValue>;
+    selectDestination(record: RecordValue): Dest | null | undefined;
+  }): Promise<Response>;
+}
+
+export type UploadVerifyResult =
+  | { ok: true }
+  | { ok: false; reason: string; response: Response };
+
+/**
+ * Individually-overridable steps of {@link singleShotReceiver}. Omit a step to
+ * keep its default — overriding `verify` does not force you to reimplement
+ * `validate`, streaming, cleanup or the success response.
+ */
+export interface SingleShotReceiverSteps<
+  Result,
+  RecordValue extends TransferUploadRecord<Result> = TransferUploadRecord<Result>,
+> {
+  /** Pre-transfer request check. Default: exact-size single PUT, no partial ranges. */
+  validate(ctx: UploadReceiverContext<Result, RecordValue>): UploadRequestValidation;
+  /** Post-transfer policy on the measured bytes. Default: size + optional sha256 match. */
+  verify(input: {
+    ctx: UploadReceiverContext<Result, RecordValue>;
+    actualSize: number;
+    actualSha256: string;
+  }): UploadVerifyResult;
+}
+
+export interface ResumableChunkInput<
+  Result,
+  RecordValue extends TransferUploadRecord<Result> = TransferUploadRecord<Result>,
+> {
+  record: RecordValue;
+  chunk: Uint8Array;
+  range: ContentRange;
+  request: Request;
+}
+
+export type ResumableChunkOutcome<Result> =
+  | { status: "incomplete"; nextOffset: number }
+  | { status: "complete"; result: Result; actualSize: number; actualSha256: string }
+  | { status: "error"; httpStatus: number; message: string };
+
+/**
+ * Backend contract for resumable uploads. The kit owns the HTTP `Content-Range`
+ * / 308 protocol and the record transitions; the implementation owns the only
+ * stateful parts — accumulating bytes across requests, tracking the committed
+ * offset, and computing the end-to-end sha256 (typically a Durable Object).
+ */
+export interface ResumableUploadDestination<
+  Result = unknown,
+  RecordValue extends TransferUploadRecord<Result> = TransferUploadRecord<Result>,
+> {
+  writeChunk(input: ResumableChunkInput<Result, RecordValue>): Promise<ResumableChunkOutcome<Result>>;
+  cleanup?(input: { record: RecordValue; reason: string }): Promise<void>;
+  response?(input: {
+    record: RecordValue;
+    result: Result;
+    actualSize: number;
+    actualSha256: string;
+  }): unknown;
+}
+
 export function createUploads<
   Result = unknown,
   Metadata = unknown,
   RecordValue extends TransferUploadRecord<Result, Metadata> = TransferUploadRecord<Result, Metadata>,
+  Dest = UploadDestination<Result, RecordValue>,
 >({
   store,
   baseUrl,
@@ -465,7 +581,8 @@ export function createUploads<
   ttlSeconds = DEFAULT_UPLOAD_TTL_SECONDS,
   token = opaqueUploadToken() as UploadTokenStrategy<RecordValue>,
   uploadPath = "/upload",
-}: CreateUploadsOptions<RecordValue>) {
+  receiver = singleShotReceiver<Result, RecordValue>() as unknown as UploadReceiver<any, RecordValue, Dest>,
+}: CreateUploadsOptions<RecordValue, Dest>) {
   const resolvedMaxBytes = resolvePositiveInteger(maxBytes, 30 * 1024 * 1024);
   const origin = baseUrl.replace(/\/$/, "");
   const normalizedUploadPath = uploadPath.startsWith("/") ? uploadPath : `/${uploadPath}`;
@@ -516,7 +633,7 @@ export function createUploads<
     uploadId,
     request,
     destination,
-  }: ReceiveUploadInput<Result, RecordValue>): Promise<Response> {
+  }: ReceiveUploadInput<Result, RecordValue, Dest>): Promise<Response> {
     return receiveWith({
       uploadId,
       request,
@@ -528,7 +645,7 @@ export function createUploads<
     uploadId,
     request,
     selectDestination,
-  }: ReceiveUploadWithInput<Result, RecordValue>): Promise<Response> {
+  }: ReceiveUploadWithInput<Result, RecordValue, Dest>): Promise<Response> {
     const record = await store.get(uploadId);
     if (!record) return jsonResponse({ error: "upload session not found" }, 404);
     if (record.status !== "pending") {
@@ -543,70 +660,32 @@ export function createUploads<
     const verified = await token.verify({ token: bearer, uploadId, record });
     if (!verified.ok) return jsonResponse({ error: verified.message }, verified.status);
 
-    const destination = selectDestination(record);
-    if (!destination) return jsonResponse({ error: "no upload destination for this upload" }, 409);
-
-    const checked = validateUploadRequest({
+    const ctx: UploadReceiverContext<Result, RecordValue> = {
+      uploadId,
       request,
-      maxBytes: Math.min(resolvedMaxBytes, record.size),
-      expectedSize: record.size,
-    });
-    if (!checked.ok) return checked.response;
-
-    const counter = createShaCountingStream(record.size);
-    let result: Result | undefined;
-    let hasResult = false;
-    let actualSha256: string;
-    let actualSize: number;
-    try {
-      result = await destination.receive({
-        record,
-        request,
-        contentLength: checked.contentLength,
-        body: request.body!.pipeThrough(counter.stream),
-      });
-      hasResult = true;
-      const finalized = counter.finalize();
-      actualSha256 = finalized.sha256;
-      actualSize = finalized.size;
-    } catch (err) {
-      const reason = err instanceof Error ? err.message : "upload failed";
-      await failUpload(
-        uploadId,
-        record,
-        reason,
-        hasResult ? { destination, result: result as Result } : undefined,
-      );
-      return jsonResponse({ error: "upload failed", reason }, 502);
-    }
-
-    if (actualSize !== record.size) {
-      const reason = `size mismatch: expected ${record.size}, actual ${actualSize}`;
-      await failUpload(uploadId, record, reason, { destination, result: result as Result });
-      return jsonResponse({ error: "size mismatch", expected: record.size, actual: actualSize }, 409);
-    }
-
-    if (record.sha256 && record.sha256.toLowerCase() !== actualSha256.toLowerCase()) {
-      await failUpload(uploadId, record, "sha256 mismatch", { destination, result: result as Result });
-      return jsonResponse({ error: "sha256 mismatch", expected: record.sha256, actual: actualSha256 }, 409);
-    }
-
-    const completed = {
-      ...record,
-      status: "completed",
-      actualSize,
-      actualSha256,
-      result,
-    } as RecordValue;
-    await store.put(uploadId, completed, storeTtl);
-
-    const body = destination.response?.({ record: completed, result, actualSize, actualSha256 }) ?? {
-      accepted: true,
-      actualSize,
-      actualSha256,
-      result,
+      record,
+      maxBytes: resolvedMaxBytes,
+      async complete({ actualSize, actualSha256, result }) {
+        const completed = {
+          ...record,
+          status: "completed",
+          actualSize,
+          actualSha256,
+          result,
+        } as RecordValue;
+        await store.put(uploadId, completed, storeTtl);
+        return completed;
+      },
+      async fail(reason) {
+        await store.put(
+          uploadId,
+          { ...record, status: "failed", failureReason: reason } as RecordValue,
+          storeTtl,
+        );
+      },
     };
-    return jsonResponse(body);
+
+    return receiver.handle({ ctx, selectDestination });
   }
 
   async function complete({ uploadId, owner }: CompleteUploadInput): Promise<RecordValue> {
@@ -634,22 +713,6 @@ export function createUploads<
     return toResult(record);
   }
 
-  async function failUpload(
-    uploadId: string,
-    record: RecordValue,
-    reason: string,
-    cleanup?: { destination: UploadDestination<Result, RecordValue>; result: Result },
-  ): Promise<void> {
-    await store.put(uploadId, { ...record, status: "failed", failureReason: reason } as RecordValue, storeTtl);
-    if (cleanup) {
-      try {
-        await cleanup.destination.cleanup?.({ record, result: cleanup.result, reason });
-      } catch {
-        // The upload state must remain failed even if backend cleanup fails.
-      }
-    }
-  }
-
   return {
     prepare,
     get,
@@ -658,6 +721,239 @@ export function createUploads<
     complete,
     completeWith,
   };
+}
+
+/**
+ * Default {@link UploadReceiver}: one PUT carries the whole body. Reproduces the
+ * historical pipeline (exact-size validation, streaming sha256 + size check,
+ * backend cleanup on failure). Pass `validate` and/or `verify` to override only
+ * those steps; everything else keeps its default.
+ */
+export function singleShotReceiver<
+  Result = unknown,
+  RecordValue extends TransferUploadRecord<Result> = TransferUploadRecord<Result>,
+>(
+  steps: Partial<SingleShotReceiverSteps<Result, RecordValue>> = {},
+): UploadReceiver<Result, RecordValue, UploadDestination<Result, RecordValue>> {
+  const validate = steps.validate ?? defaultSingleShotValidate;
+  const verify = steps.verify ?? defaultSingleShotVerify;
+
+  return {
+    async handle({ ctx, selectDestination }) {
+      const destination = selectDestination(ctx.record);
+      if (!destination) {
+        return jsonResponse({ error: "no upload destination for this upload" }, 409);
+      }
+
+      const checked = validate(ctx);
+      if (!checked.ok) return checked.response;
+
+      const counter = createShaCountingStream(ctx.record.size);
+      let result: Result | undefined;
+      let hasResult = false;
+      let actualSha256: string;
+      let actualSize: number;
+      try {
+        result = await destination.receive({
+          record: ctx.record,
+          request: ctx.request,
+          contentLength: checked.contentLength,
+          body: ctx.request.body!.pipeThrough(counter.stream),
+        });
+        hasResult = true;
+        const finalized = counter.finalize();
+        actualSha256 = finalized.sha256;
+        actualSize = finalized.size;
+      } catch (err) {
+        const reason = err instanceof Error ? err.message : "upload failed";
+        await ctx.fail(reason);
+        if (hasResult) await runCleanup(destination, ctx.record, result as Result, reason);
+        return jsonResponse({ error: "upload failed", reason }, 502);
+      }
+
+      const verdict = verify({ ctx, actualSize, actualSha256 });
+      if (!verdict.ok) {
+        await ctx.fail(verdict.reason);
+        await runCleanup(destination, ctx.record, result as Result, verdict.reason);
+        return verdict.response;
+      }
+
+      const completed = await ctx.complete({ actualSize, actualSha256, result: result as Result });
+      const body =
+        destination.response?.({ record: completed, result: result as Result, actualSize, actualSha256 }) ?? {
+          accepted: true,
+          actualSize,
+          actualSha256,
+          result,
+        };
+      return jsonResponse(body);
+    },
+  };
+}
+
+/**
+ * {@link UploadReceiver} for chunked, resumable uploads. The kit handles the
+ * `Content-Range` / 308 wire protocol and record transitions; the selected
+ * {@link ResumableUploadDestination} owns the cross-request state (offset,
+ * accumulated bytes, end-to-end sha256) — usually a Durable Object.
+ */
+export function resumableReceiver<
+  Result = unknown,
+  RecordValue extends TransferUploadRecord<Result> = TransferUploadRecord<Result>,
+>(): UploadReceiver<Result, RecordValue, ResumableUploadDestination<Result, RecordValue>> {
+  return {
+    async handle({ ctx, selectDestination }) {
+      const destination = selectDestination(ctx.record);
+      if (!destination) {
+        return jsonResponse({ error: "no upload destination for this upload" }, 409);
+      }
+      if (!ctx.request.body) return jsonResponse({ error: "missing body" }, 400);
+
+      const rangeHeader = ctx.request.headers.get("Content-Range");
+      if (!rangeHeader) {
+        return jsonResponse({ error: "Content-Range required for resumable upload" }, 400);
+      }
+      const range = parseContentRange(rangeHeader);
+      if (!range) return jsonResponse({ error: `invalid Content-Range: ${rangeHeader}` }, 400);
+      if (range.total !== ctx.record.size) {
+        return jsonResponse(
+          { error: `Content-Range total ${range.total} != size ${ctx.record.size}` },
+          400,
+        );
+      }
+      const contentLength = Number(
+        ctx.request.headers.get("Content-Length") ?? ctx.request.headers.get("X-Upload-Content-Length") ?? "",
+      );
+      if (!Number.isSafeInteger(contentLength) || contentLength <= 0) {
+        return jsonResponse({ error: "Content-Length required" }, 411);
+      }
+      if (range.end - range.start + 1 !== contentLength) {
+        return jsonResponse({ error: "Content-Range size != Content-Length" }, 400);
+      }
+
+      const chunk = new Uint8Array(await ctx.request.arrayBuffer());
+
+      let outcome: ResumableChunkOutcome<Result>;
+      try {
+        outcome = await destination.writeChunk({ record: ctx.record, chunk, range, request: ctx.request });
+      } catch (err) {
+        const reason = err instanceof Error ? err.message : "chunk write failed";
+        await ctx.fail(reason);
+        await runResumableCleanup(destination, ctx.record, reason);
+        return jsonResponse({ error: "upload failed", reason }, 502);
+      }
+
+      if (outcome.status === "incomplete") {
+        return jsonResponse({ status: "incomplete", nextOffset: outcome.nextOffset }, 308, {
+          Range: `bytes=0-${outcome.nextOffset - 1}`,
+        });
+      }
+
+      if (outcome.status === "error") {
+        await ctx.fail(outcome.message);
+        await runResumableCleanup(destination, ctx.record, outcome.message);
+        return jsonResponse({ error: outcome.message }, outcome.httpStatus);
+      }
+
+      if (
+        ctx.record.sha256 &&
+        outcome.actualSha256 &&
+        ctx.record.sha256.toLowerCase() !== outcome.actualSha256.toLowerCase()
+      ) {
+        const reason = "sha256 mismatch";
+        await ctx.fail(reason);
+        await runResumableCleanup(destination, ctx.record, reason);
+        return jsonResponse(
+          { error: reason, expected: ctx.record.sha256, actual: outcome.actualSha256 },
+          409,
+        );
+      }
+
+      const completed = await ctx.complete({
+        actualSize: outcome.actualSize,
+        actualSha256: outcome.actualSha256,
+        result: outcome.result,
+      });
+      const body =
+        destination.response?.({
+          record: completed,
+          result: outcome.result,
+          actualSize: outcome.actualSize,
+          actualSha256: outcome.actualSha256,
+        }) ?? {
+          accepted: true,
+          actualSize: outcome.actualSize,
+          actualSha256: outcome.actualSha256,
+          result: outcome.result,
+        };
+      return jsonResponse(body);
+    },
+  };
+}
+
+function defaultSingleShotValidate<
+  Result,
+  RecordValue extends TransferUploadRecord<Result>,
+>(ctx: UploadReceiverContext<Result, RecordValue>): UploadRequestValidation {
+  return validateUploadRequest({
+    request: ctx.request,
+    maxBytes: Math.min(ctx.maxBytes, ctx.record.size),
+    expectedSize: ctx.record.size,
+  });
+}
+
+function defaultSingleShotVerify<
+  Result,
+  RecordValue extends TransferUploadRecord<Result>,
+>({
+  ctx,
+  actualSize,
+  actualSha256,
+}: {
+  ctx: UploadReceiverContext<Result, RecordValue>;
+  actualSize: number;
+  actualSha256: string;
+}): UploadVerifyResult {
+  if (actualSize !== ctx.record.size) {
+    return {
+      ok: false,
+      reason: `size mismatch: expected ${ctx.record.size}, actual ${actualSize}`,
+      response: jsonResponse({ error: "size mismatch", expected: ctx.record.size, actual: actualSize }, 409),
+    };
+  }
+  if (ctx.record.sha256 && ctx.record.sha256.toLowerCase() !== actualSha256.toLowerCase()) {
+    return {
+      ok: false,
+      reason: "sha256 mismatch",
+      response: jsonResponse({ error: "sha256 mismatch", expected: ctx.record.sha256, actual: actualSha256 }, 409),
+    };
+  }
+  return { ok: true };
+}
+
+async function runCleanup<Result, RecordValue extends TransferUploadRecord<Result>>(
+  destination: UploadDestination<Result, RecordValue>,
+  record: RecordValue,
+  result: Result,
+  reason: string,
+): Promise<void> {
+  try {
+    await destination.cleanup?.({ record, result, reason });
+  } catch {
+    // The upload state must remain failed even if backend cleanup fails.
+  }
+}
+
+async function runResumableCleanup<Result, RecordValue extends TransferUploadRecord<Result>>(
+  destination: ResumableUploadDestination<Result, RecordValue>,
+  record: RecordValue,
+  reason: string,
+): Promise<void> {
+  try {
+    await destination.cleanup?.({ record, reason });
+  } catch {
+    // The upload state must remain failed even if backend cleanup fails.
+  }
 }
 
 export async function streamToUint8Array(stream: ReadableStream<Uint8Array>): Promise<Uint8Array> {

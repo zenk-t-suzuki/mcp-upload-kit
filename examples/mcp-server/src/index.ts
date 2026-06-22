@@ -1,10 +1,18 @@
+// 最小構成の MCP アップロードサーバ（single-shot: 1回の PUT でファイル全体を送る）。
+//
+// モデルがたどる流れ:
+//   1. prepare_upload  を呼ぶ -> 短期有効な HTTPS PUT URL + token を受け取る
+//   2. その URL に生バイトを PUT する（ツール呼び出しではなく通常の HTTPS PUT）
+//   3. complete_upload を呼ぶ -> 保存済みファイルの最終結果を受け取る
+//
+// バックエンド固有なのは `destination` だけ。実ストレージに差し替える。
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { z } from "zod";
 import {
-  createUploadMcp,
-  kvUploadStore,
-  opaqueUploadToken,
+  createUploads,
+  registerCompleteUploadTool,
   standardUploadInput,
+  opaqueUploadToken,
+  kvUploadStore,
   streamToUint8Array,
   type TransferUploadRecord,
   type UploadDestination,
@@ -12,138 +20,78 @@ import {
 
 interface Env {
   UPLOAD_KV: KVNamespace;
-  MAX_UPLOAD_BYTES?: string;
+  WORKER_BASE_URL: string;
 }
 
-type UploadMetadata =
-  | { purpose: "avatar"; profileId: string }
-  | { purpose: "attachment"; recordId: string };
+// `destination` が返す値。kit が record の `result` として保存する。
+interface StoredFile {
+  objectKey: string;
+}
+type FileRecord = TransferUploadRecord<StoredFile>;
 
-type UploadResult =
-  | { purpose: "avatar"; imageUrl: string }
-  | { purpose: "attachment"; storedText: string };
-
-type UploadRecord = TransferUploadRecord<UploadResult, UploadMetadata>;
-
-const avatarStorage: UploadDestination<UploadResult, UploadRecord> = {
+// 唯一のバックエンド固有部分。既定の receiver がリクエストを検証済みなので、
+// ここでは受信ストリームを保存して識別子を返すだけ。
+const destination: UploadDestination<StoredFile, FileRecord> = {
   async receive({ record, body }) {
-    if (record.metadata?.purpose !== "avatar") {
-      throw new Error("avatar upload expected");
-    }
-    await streamToUint8Array(body);
-    return {
-      purpose: "avatar",
-      imageUrl: `https://cdn.example.test/profiles/${record.metadata.profileId}/avatar`,
-    };
+    await streamToUint8Array(body); // TODO: `body` を実ストレージへ書き込む。
+    return { objectKey: record.uploadId };
   },
-  response({ result, actualSize, actualSha256 }) {
-    if (result.purpose !== "avatar") {
-      throw new Error("avatar upload result expected");
-    }
-    return {
-      accepted: true,
-      purpose: result.purpose,
-      imageUrl: result.imageUrl,
-      actualSize,
-      actualSha256,
-    };
-  },
+  response: ({ result }) => ({ objectKey: result.objectKey }),
 };
 
-const attachmentStorage: UploadDestination<UploadResult, UploadRecord> = {
-  async receive({ body }) {
-    return {
-      purpose: "attachment",
-      storedText: new TextDecoder().decode(await streamToUint8Array(body)),
-    };
-  },
-  response({ result, actualSize, actualSha256 }) {
-    return {
-      accepted: true,
-      purpose: result.purpose,
-      actualSize,
-      actualSha256,
-    };
-  },
-};
-
-function createDemoUploadMcp(env: Env, origin: string) {
-  return createUploadMcp<UploadResult, UploadMetadata, UploadRecord>({
-    store: kvUploadStore<UploadRecord>(env.UPLOAD_KV),
-    baseUrl: origin,
-    maxBytes: env.MAX_UPLOAD_BYTES ?? 30 * 1024 * 1024,
+function uploads(env: Env) {
+  return createUploads<StoredFile>({
+    store: kvUploadStore<FileRecord>(env.UPLOAD_KV),
+    baseUrl: env.WORKER_BASE_URL,
+    maxBytes: 30 * 1024 * 1024,
     token: opaqueUploadToken(),
-    completeDescription: "Complete any avatar or attachment upload prepared by this server.",
-  })
-    .addPurpose("avatar", {
-      title: "Prepare avatar upload",
-      description: "Create a short-lived upload URL for a profile avatar image.",
-      inputSchema: standardUploadInput({
-        contentType: z.enum(["image/png", "image/jpeg", "image/webp"]),
-        maxSize: 5 * 1024 * 1024,
-        extra: {
-          profileId: z.string().min(1),
-        },
-      }),
-      destination: avatarStorage,
-      metadata(input: { profileId: string }) {
-        return { profileId: input.profileId };
-      },
-    })
-    .addPurpose("attachment", {
-      title: "Prepare attachment upload",
-      description: "Create a short-lived upload URL for a record attachment.",
-      inputSchema: standardUploadInput({
-        extra: {
-          recordId: z.string().min(1),
-        },
-      }),
-      destination: attachmentStorage,
-      metadata(input: { recordId: string }) {
-        return { recordId: input.recordId };
-      },
-    });
+    // `receiver` 省略時は singleShotReceiver()（既定）。
+  });
 }
 
-function registerProfileSummaryTool(server: McpServer): void {
+// 2つのアップロードツールを MCP サーバへ登録する。
+// `getOwner` は認証済みユーザ ID を返す（例: リクエストの認証コンテキストから）。
+export function registerUploadTools(server: McpServer, env: Env, getOwner: () => string): void {
+  const ctrl = uploads(env);
+
   server.registerTool(
-    "get_profile_summary",
+    "prepare_upload",
     {
-      title: "Get profile summary",
-      description: "Return profile metadata that does not involve file uploads.",
-      inputSchema: {
-        profileId: z.string().min(1),
-      },
+      title: "Prepare upload",
+      description: "Issue a short-lived HTTPS PUT URL for one file.",
+      inputSchema: standardUploadInput(), // { name, size, contentType, sha256? }
     },
-    async ({ profileId }) => {
-      const result = {
-        profileId: String(profileId),
-        displayName: `Profile ${profileId}`,
-        avatarConfigured: false,
+    async (input) => {
+      const { name, size, contentType, sha256 } = input as {
+        name: string;
+        size: number;
+        contentType: string;
+        sha256?: string;
       };
-      return {
-        structuredContent: result,
-        content: [{ type: "text", text: JSON.stringify(result) }],
-      };
+      const prepared = await ctrl.prepare({
+        owner: getOwner(),
+        name,
+        size,
+        contentType,
+        ...(sha256 ? { sha256 } : {}),
+      });
+      return { structuredContent: { ...prepared }, content: [{ type: "text", text: JSON.stringify(prepared) }] };
     },
   );
+
+  // 共通の完了ツール: ステータスを確認し、保存結果を返す。
+  registerCompleteUploadTool(server, {
+    uploads: ctrl,
+    getOwner,
+    toResult: (record) => ({
+      objectKey: record.result?.objectKey ?? "",
+      size: record.actualSize ?? record.size,
+      sha256: record.actualSha256 ?? "",
+    }),
+  });
 }
 
-export function registerDemoTools(
-  server: McpServer,
-  env: Env,
-  origin: string,
-  getOwner: () => string,
-): void {
-  registerProfileSummaryTool(server);
-  createDemoUploadMcp(env, origin).registerTools(server, getOwner);
-}
-
-export async function handleUploadRoute(
-  request: Request,
-  env: Env,
-  origin: string,
-  uploadId: string,
-): Promise<Response> {
-  return createDemoUploadMcp(env, origin).receive(request, uploadId);
+// Worker の fetch ハンドラで `PUT /upload/:uploadId` をここへ繋ぐ。
+export function handleUpload(request: Request, env: Env, uploadId: string): Promise<Response> {
+  return uploads(env).receive({ uploadId, request, destination });
 }

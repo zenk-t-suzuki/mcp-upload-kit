@@ -24,3 +24,14 @@ JWT signing secrets must be generated with a cryptographically secure random
 source, contain at least 32 bytes, and be stored outside source control. Rotating
 the signing secret invalidates outstanding upload tokens; applications should
 coordinate rotation with their upload TTL.
+
+## Operational guidance
+
+- Upload URLs and tokens are bearer credentials. Keep TTLs short and send them
+  only to the authenticated client that requested the upload.
+- Always pass `owner` to `complete` / `completeWith` when completing uploads for
+  an authenticated user.
+- Validate allowed MIME types and sizes before calling `prepare`;
+  `standardUploadInput` can enforce those constraints for MCP tools.
+- Provide `sha256` at `prepare` time when the caller can compute an expected
+  digest and your flow benefits from end-to-end integrity checks.

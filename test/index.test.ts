@@ -4,6 +4,8 @@ import {
   createUploadMcpBuilder,
   createUploadMcp,
   createUploads,
+  singleShotReceiver,
+  resumableReceiver,
   createShaCountingStream,
   createUploadToken,
   extractBearerToken,
@@ -23,6 +25,8 @@ import {
   type TransferUploadRecord,
   type UploadKvNamespace,
   type McpToolResult,
+  type ResumableUploadDestination,
+  type ResumableChunkOutcome,
 } from "../src/index";
 
 const SECRET = "test-secret-key-of-sufficient-length";
@@ -779,6 +783,290 @@ describe("createUploadMcpBuilder", () => {
     });
   });
 });
+
+describe("singleShotReceiver step overrides", () => {
+  test("overriding verify keeps validate, streaming and the success path intact", async () => {
+    const uploads = createUploads<{ objectKey: string }>({
+      store: kvUploadStore<TransferUploadRecord<{ objectKey: string }>>(memoryKv()),
+      baseUrl: "https://files.example.test",
+      maxBytes: 1024,
+      // Accept whatever bytes arrive — e.g. a backend that hashes server-side.
+      receiver: singleShotReceiver<{ objectKey: string }>({
+        verify: () => ({ ok: true }),
+      }),
+    });
+    const prepared = await uploads.prepare({
+      owner: "user-1",
+      name: "relaxed.txt",
+      size: 5,
+      contentType: "text/plain",
+      sha256: "f".repeat(64), // intentionally wrong — default verify would 409
+    });
+
+    const response = await uploads.receive({
+      uploadId: prepared.uploadId,
+      request: uploadRequest(prepared.uploadUrl, prepared.uploadToken, new TextEncoder().encode("hello")),
+      destination: {
+        async receive({ record, body }) {
+          await streamToUint8Array(body);
+          return { objectKey: record.uploadId };
+        },
+      },
+    });
+
+    expect(response.status).toBe(200);
+    const completed = await uploads.complete({ uploadId: prepared.uploadId });
+    expect(completed.status).toBe("completed");
+    expect(completed.result).toEqual({ objectKey: prepared.uploadId });
+  });
+
+  test("a custom verify can reject and still triggers cleanup", async () => {
+    let cleaned = false;
+    const uploads = createUploads<{ objectKey: string }>({
+      store: kvUploadStore<TransferUploadRecord<{ objectKey: string }>>(memoryKv()),
+      baseUrl: "https://files.example.test",
+      maxBytes: 1024,
+      receiver: singleShotReceiver<{ objectKey: string }>({
+        verify: () => ({
+          ok: false,
+          reason: "policy: rejected",
+          response: jsonResponse({ error: "policy: rejected" }, 422),
+        }),
+      }),
+    });
+    const prepared = await uploads.prepare({
+      owner: "user-1",
+      name: "policy.txt",
+      size: 5,
+      contentType: "text/plain",
+    });
+
+    const response = await uploads.receive({
+      uploadId: prepared.uploadId,
+      request: uploadRequest(prepared.uploadUrl, prepared.uploadToken, new TextEncoder().encode("hello")),
+      destination: {
+        async receive({ body }) {
+          await streamToUint8Array(body);
+          return { objectKey: "obj" };
+        },
+        async cleanup() {
+          cleaned = true;
+        },
+      },
+    });
+
+    expect(response.status).toBe(422);
+    expect(cleaned).toBe(true);
+    await expect(uploads.complete({ uploadId: prepared.uploadId })).rejects.toThrow(/policy: rejected/);
+  });
+
+  test("default validate is still enforced when only verify is overridden", async () => {
+    const uploads = createUploads({
+      store: kvUploadStore<TransferUploadRecord>(memoryKv()),
+      baseUrl: "https://files.example.test",
+      maxBytes: 1024,
+      receiver: singleShotReceiver({ verify: () => ({ ok: true }) }),
+    });
+    const prepared = await uploads.prepare({
+      owner: "user-1",
+      name: "len.txt",
+      size: 5,
+      contentType: "text/plain",
+    });
+    // Content-Length (3) does not match the prepared size (5): default validate rejects.
+    const response = await uploads.receive({
+      uploadId: prepared.uploadId,
+      request: new Request(prepared.uploadUrl, {
+        method: "PUT",
+        headers: { Authorization: `Bearer ${prepared.uploadToken}`, "Content-Length": "3" },
+        body: new TextEncoder().encode("hey") as unknown as BodyInit,
+      }),
+      destination: { async receive() { return {}; } },
+    });
+    expect(response.status).toBe(400);
+  });
+});
+
+describe("resumableReceiver", () => {
+  type Result = { objectKey: string };
+  type RecordValue = TransferUploadRecord<Result>;
+
+  function memoryResumable(onCleanup?: () => void): ResumableUploadDestination<Result, RecordValue> {
+    const chunks: Uint8Array[] = [];
+    let offset = 0;
+    return {
+      async writeChunk({ record, chunk, range }): Promise<ResumableChunkOutcome<Result>> {
+        if (range.start !== offset) {
+          return { status: "error", httpStatus: 409, message: `offset mismatch: expected ${offset}` };
+        }
+        chunks.push(chunk);
+        offset = range.end + 1;
+        if (offset < range.total) return { status: "incomplete", nextOffset: offset };
+        const all = concat(chunks);
+        return {
+          status: "complete",
+          result: { objectKey: record.uploadId },
+          actualSize: all.byteLength,
+          actualSha256: await sha256Hex(all),
+        };
+      },
+      async cleanup() {
+        onCleanup?.();
+      },
+    };
+  }
+
+  test("accepts chunks, returns 308 then 200 and stores the result", async () => {
+    const dest = memoryResumable();
+    const uploads = createUploads<Result, unknown, RecordValue, ResumableUploadDestination<Result, RecordValue>>({
+      store: kvUploadStore<RecordValue>(memoryKv()),
+      baseUrl: "https://files.example.test",
+      maxBytes: 1024,
+      receiver: resumableReceiver<Result, RecordValue>(),
+    });
+    const prepared = await uploads.prepare({
+      owner: "user-1",
+      name: "big.txt",
+      size: 11,
+      contentType: "text/plain",
+    });
+
+    const first = await uploads.receiveWith({
+      uploadId: prepared.uploadId,
+      request: chunkRequest(prepared.uploadUrl, prepared.uploadToken, new TextEncoder().encode("hello "), 0, 5, 11),
+      selectDestination: () => dest,
+    });
+    expect(first.status).toBe(308);
+    expect(first.headers.get("Range")).toBe("bytes=0-5");
+    expect(await first.json()).toMatchObject({ status: "incomplete", nextOffset: 6 });
+
+    const second = await uploads.receiveWith({
+      uploadId: prepared.uploadId,
+      request: chunkRequest(prepared.uploadUrl, prepared.uploadToken, new TextEncoder().encode("world"), 6, 10, 11),
+      selectDestination: () => dest,
+    });
+    expect(second.status).toBe(200);
+    expect(await second.json()).toMatchObject({
+      accepted: true,
+      actualSize: 11,
+      result: { objectKey: prepared.uploadId },
+    });
+
+    const completed = await uploads.complete({ uploadId: prepared.uploadId });
+    expect(completed.status).toBe("completed");
+    expect(completed.actualSha256).toBe(
+      "b94d27b9934d3e08a52e52d7da7dabfac484efe37a5380ee9088f7ace2efcde9",
+    );
+  });
+
+  test("rejects sha256 mismatch on the final chunk and runs cleanup", async () => {
+    let cleaned = false;
+    const dest = memoryResumable(() => {
+      cleaned = true;
+    });
+    const uploads = createUploads<Result, unknown, RecordValue, ResumableUploadDestination<Result, RecordValue>>({
+      store: kvUploadStore<RecordValue>(memoryKv()),
+      baseUrl: "https://files.example.test",
+      maxBytes: 1024,
+      receiver: resumableReceiver<Result, RecordValue>(),
+    });
+    const prepared = await uploads.prepare({
+      owner: "user-1",
+      name: "mismatch.txt",
+      size: 11,
+      contentType: "text/plain",
+      sha256: "a".repeat(64),
+    });
+
+    const response = await uploads.receiveWith({
+      uploadId: prepared.uploadId,
+      request: chunkRequest(prepared.uploadUrl, prepared.uploadToken, new TextEncoder().encode("hello world"), 0, 10, 11),
+      selectDestination: () => dest,
+    });
+
+    expect(response.status).toBe(409);
+    expect(await response.json()).toMatchObject({ error: "sha256 mismatch" });
+    expect(cleaned).toBe(true);
+    await expect(uploads.complete({ uploadId: prepared.uploadId })).rejects.toThrow(/sha256 mismatch/);
+  });
+
+  test("propagates a destination error outcome as its http status", async () => {
+    const dest = memoryResumable();
+    const uploads = createUploads<Result, unknown, RecordValue, ResumableUploadDestination<Result, RecordValue>>({
+      store: kvUploadStore<RecordValue>(memoryKv()),
+      baseUrl: "https://files.example.test",
+      maxBytes: 1024,
+      receiver: resumableReceiver<Result, RecordValue>(),
+    });
+    const prepared = await uploads.prepare({
+      owner: "user-1",
+      name: "gap.txt",
+      size: 11,
+      contentType: "text/plain",
+    });
+    // Start at offset 6 while the destination expects 0 -> offset mismatch (409).
+    const response = await uploads.receiveWith({
+      uploadId: prepared.uploadId,
+      request: chunkRequest(prepared.uploadUrl, prepared.uploadToken, new TextEncoder().encode("world"), 6, 10, 11),
+      selectDestination: () => dest,
+    });
+    expect(response.status).toBe(409);
+    const errorBody = (await response.json()) as { error: string };
+    expect(errorBody.error).toMatch(/offset mismatch/);
+  });
+
+  test("requires a Content-Range header", async () => {
+    const dest = memoryResumable();
+    const uploads = createUploads<Result, unknown, RecordValue, ResumableUploadDestination<Result, RecordValue>>({
+      store: kvUploadStore<RecordValue>(memoryKv()),
+      baseUrl: "https://files.example.test",
+      maxBytes: 1024,
+      receiver: resumableReceiver<Result, RecordValue>(),
+    });
+    const prepared = await uploads.prepare({
+      owner: "user-1",
+      name: "norange.txt",
+      size: 5,
+      contentType: "text/plain",
+    });
+    const response = await uploads.receiveWith({
+      uploadId: prepared.uploadId,
+      request: uploadRequest(prepared.uploadUrl, prepared.uploadToken, new TextEncoder().encode("hello")),
+      selectDestination: () => dest,
+    });
+    expect(response.status).toBe(400);
+  });
+});
+
+function concat(chunks: Uint8Array[]): Uint8Array {
+  const total = chunks.reduce((n, c) => n + c.byteLength, 0);
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const c of chunks) {
+    out.set(c, offset);
+    offset += c.byteLength;
+  }
+  return out;
+}
+
+function chunkRequest(
+  url: string,
+  token: string,
+  body: Uint8Array,
+  start: number,
+  end: number,
+  total: number,
+): Request {
+  return new Request(url, {
+    method: "PUT",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Length": String(body.byteLength),
+      "Content-Range": `bytes ${start}-${end}/${total}`,
+    },
+    body: body as unknown as BodyInit,
+  });
+}
 
 function uploadRequest(url: string, token: string, body: Uint8Array): Request {
   return new Request(url, {
